@@ -10,6 +10,7 @@ from transformers import DefaultDataCollator
 from typing import Dict, List
 
 import prompt_template
+import utils
 from root_dir_path import ROOT_DIR
 from utils import get_model, load_data
 
@@ -34,9 +35,7 @@ class TrainingData(Dataset):
             if len(input_ids) > max_length:
                 input_ids = input_ids[:max_length]
                 labels = labels[:max_length]
-            attention_mask = [1] * len(input_ids) + [0] * (max_length - len(input_ids))
-            input_ids += [pad_token_id] * (max_length - len(input_ids))
-            labels += [self.ignored_id] * (max_length - len(labels))
+            attention_mask = [1] * len(input_ids)
             self.dataset.append({
                 "input_ids": input_ids,
                 "labels": labels,
@@ -92,7 +91,7 @@ def get_train_data(aug_model, augments, tokenizer, args):
 
 
 def train(question, augments, args, model, tokenizer, 
-          init_adapter_path, save_path):
+          init_adapter_path, save_paths):
     prompt_ids = get_train_data(args.augment_model, augments, tokenizer, args)
     train_data = TrainingData(prompt_ids, tokenizer)
     train_dataloader = torch.utils.data.DataLoader(
@@ -106,15 +105,16 @@ def train(question, augments, args, model, tokenizer,
     model.model_parallel = True
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     optimizer = torch.optim.AdamW(model_parameters, lr=args.learning_rate)
-    for epoch in range(args.num_train_epochs):
+    for epoch in range(max(save_paths)):
         for step, batch in enumerate(train_dataloader):
             optimizer.zero_grad()
             outputs = model(**batch)
             loss = outputs.loss
             loss.backward()
             optimizer.step()
-    os.makedirs(save_path, exist_ok=True)
-    model.save_pretrained(save_path)
+        if epoch + 1 in save_paths:
+            os.makedirs(save_paths[epoch + 1], exist_ok=True)
+            model.save_pretrained(save_paths[epoch + 1])
     model = model.unload()
     torch.cuda.empty_cache()
     gc.collect()
@@ -122,14 +122,17 @@ def train(question, augments, args, model, tokenizer,
 
 
 def main(args):
+    utils.DATA_ROOT_DIR = os.path.join(ROOT_DIR, args.data_dir)
     data_list = load_data(args.dataset, args.data_type, args.augment_model)
     model, tokenizer, _generation_config = get_model(args.model_name)
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.train()
     if args.with_cot:
         prompt_template.get_fewshot(args.dataset)
 
     init_adapter_path = os.path.join(
         ROOT_DIR, 
-        "offline", 
+        args.offline_dir, 
         args.model_name, 
         f"rank={args.lora_rank}_alpha={args.lora_alpha}",
         "base_weight",
@@ -152,31 +155,32 @@ def main(args):
         model.save_pretrained(init_adapter_path)
         time.sleep(2)
         assert os.path.exists(os.path.join(init_adapter_path, "adapter_model.safetensors")) 
+        model = model.unload()
 
     cot_name = "cot" if args.with_cot else "direct"
     for filename, fulldata in data_list:
         filename = filename.split('.')[0] 
         print(f"### Solving {filename} ###")
-        output_dir = os.path.join(
+        output_dirs = {epoch: os.path.join(
             ROOT_DIR, 
-            "offline", 
+            args.offline_dir, 
             args.model_name, 
             f"rank={args.lora_rank}_alpha={args.lora_alpha}",
             args.dataset,
-            f"lr={args.learning_rate}_epoch={args.num_train_epochs}_{cot_name}",
+            f"lr={args.learning_rate}_epoch={epoch}_{cot_name}",
             f"aug_model={args.augment_model}",
             filename,
-        )
-        os.makedirs(output_dir, exist_ok=True)
+        ) for epoch in args.save_epochs}
         fulldata = fulldata if args.sample == -1 else fulldata[:args.sample]
         for did, data in tqdm(enumerate(fulldata), total=len(fulldata)):
             augment = data["augment"]
             for pid in range(len(augment)):
-                save_path = os.path.join(output_dir, f"data_{did}", f"passage_{pid}")
-                if os.path.exists(os.path.join(save_path, "adapter_model.safetensors")):
+                save_paths = {epoch: os.path.join(output_dir, f"data_{did}", f"passage_{pid}")
+                              for epoch, output_dir in output_dirs.items()}
+                if all(os.path.exists(os.path.join(p, "adapter_model.safetensors")) for p in save_paths.values()):
                     continue
                 model = train(data["question"], [augment[pid]], args, model, tokenizer, 
-                            init_adapter_path, save_path)
+                            init_adapter_path, save_paths)
                 
 
 if __name__ == "__main__":
@@ -191,6 +195,9 @@ if __name__ == "__main__":
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
     parser.add_argument("--num_train_epochs", type=int, default=3)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
+    parser.add_argument("--save_epochs", type=str, default=None) # e.g. 1,2,4: save after each of these epochs
+    parser.add_argument("--offline_dir", type=str, default="offline")
+    parser.add_argument("--data_dir", type=str, default="data_aug")
     # LoRA
     parser.add_argument("--lora_rank", type=int, default=None)
     parser.add_argument("--lora_alpha", type=int, default=None)
@@ -198,5 +205,7 @@ if __name__ == "__main__":
     assert args.lora_rank and args.lora_alpha, "No config for LoRA"
     if args.augment_model is None:
         args.augment_model = args.model_name
+    args.save_epochs = (sorted({int(e) for e in args.save_epochs.split(",")}) if args.save_epochs
+                        else [args.num_train_epochs])
     print(args)
     main(args)

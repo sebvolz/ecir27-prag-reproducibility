@@ -1,3 +1,76 @@
+# Reproducibility Study of Parametric RAG
+
+This repository is a copy of the [official Parametric RAG code](https://github.com/oneal2000/PRAG) (commit `43d7e14`)
+with the additions used in our reproducibility study. The first commit is the unchanged original code; the second
+commit contains all our changes (`git diff HEAD~1`). The original README follows below.
+
+### Environments
+
+All experiments use Python 3.10, `torch==1.13.1` and `transformers==4.44.2` (`requirements.txt`). The two
+environments differ only in the peft version:
+
+```
+pip install -r requirements.txt                                # peft 0.13.2, as in the original code
+pip install -r requirements.txt && pip install peft==0.21.0   # second environment
+```
+
+With peft 0.13.2, `model.unload()` keeps the configs of unloaded adapters, so from the second question on only the
+adapter of the first passage is applied. peft 0.21.0 merges all adapters. Adapters are trained with peft 0.13.2.
+Set `ROOT_DIR` in `src/root_dir_path.py` as described below.
+
+### Data
+
+- `data_aug.tar.gz`: the original augmented data (top-3 passages), unchanged.
+- `data_aug_top20.tar.gz`: top-20 BM25 passages per question (same index, queries and augmentation prompts as the
+  original), augmented with `llama3.2-1b-instruct`. As in the original, passages whose augmentation failed are
+  skipped. Same 300 questions per dataset and type as `data_aug`.
+
+### Added arguments
+
+`src/encode.py`:
+
+| Argument | Description |
+|---|---|
+| `--data_dir` | augmented data folder (default `data_aug`; `data_aug_top20` for the top-20 passages) |
+| `--offline_dir` | adapter folder (default `offline`) |
+| `--save_epochs` | e.g. `1,2,4`: save the adapters after each of these epochs |
+
+`src/inference.py`:
+
+| Argument | Description |
+|---|---|
+| `--inference_method vanilla` | the LLM without passages or adapters |
+| `--exp_name` | extra output folder, `output/<exp_name>/...` |
+| `--data_dir`, `--offline_dir` | as above |
+| `--num_passages` | use only the top-n passages (and their adapters) |
+| `--merge_strategy` | `cat` (original), `linear`, `ties`, `dare_linear` (peft `add_weighted_adapter`) |
+| `--merge_weight` | weight per adapter: `one` (original, adapters summed), `inv_n` (1/n, averaged), `inv_n2` (1/n²; average-sized update for `linear` and `dare_linear`, which apply √w to A and B separately), `relevance` (softmax over cross-encoder scores) |
+| `--merge_density`, `--merge_seed` | density for `ties`/`dare_linear`, seed for `dare_linear` |
+| `--shuffle_adapters`, `--shuffle_passages`, `--shuffle_seed` | each question uses the adapters (`prag`) or passages (`icl`) of another question of the same dataset and type |
+| `--relevance_dir` | scores for `--merge_weight relevance`, written by `src/score_passages.py` |
+
+`src/score_passages.py` scores each question's passages with `cross-encoder/ms-marco-MiniLM-L-6-v2`:
+
+```
+python src/score_passages.py --dataset popqa --augment_model llama3.2-1b-instruct
+```
+
+Training and generation hyperparameters per model and dataset are those in `configs/`. Example: P-RAG with the
+top-10 passages, adapters averaged (the top-20 adapters start from the same LoRA initialization as `offline/`):
+
+```
+mkdir -p offline-top20/llama3.2-1b-instruct/rank=2_alpha=32
+cp -r offline/llama3.2-1b-instruct/rank=2_alpha=32/base_weight offline-top20/llama3.2-1b-instruct/rank=2_alpha=32/
+python src/encode.py --model_name=llama3.2-1b-instruct --dataset=popqa --sample=300 --per_device_train_batch_size=1 \
+    --num_train_epochs=2 --learning_rate=0.0003 --lora_rank=2 --lora_alpha=32 \
+    --data_dir=data_aug_top20 --offline_dir=offline-top20
+python src/inference.py --model_name=llama3.2-1b-instruct --dataset=popqa --sample=300 --num_train_epochs=2 \
+    --learning_rate=0.0003 --lora_rank=2 --lora_alpha=32 --max_new_tokens=20 --inference_method=prag \
+    --data_dir=data_aug_top20 --offline_dir=offline-top20 --num_passages=10 --merge_weight=inv_n --exp_name=top20-n10
+```
+
+---
+
 # Parametric RAG
 
 📢 **News: this work has been accepted at the SIGIR 2025!**
